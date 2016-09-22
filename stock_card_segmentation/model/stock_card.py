@@ -8,6 +8,16 @@ SEGMENTATION = ['material', 'landed', 'production', 'subcontracting']
 class StockCardProduct(models.TransientModel):
     _inherit = ['stock.card.product']
 
+    def _get_fieldnames(self):
+        res = super(StockCardProduct, self)._get_fieldnames()
+        res.update({
+            'material': 'material_cost',
+            'landed': 'landed_cost',
+            'production': 'production_cost',
+            'subcontracting': 'subcontracting_cost',
+        })
+        return res
+
     def _get_avg_fields(self):
         res = super(StockCardProduct, self)._get_avg_fields()
         return res + SEGMENTATION
@@ -41,6 +51,12 @@ class StockCardProduct(models.TransientModel):
             ['%s_valuation' % sgmnt for sgmnt in SEGMENTATION], 0.0))
         res.update({}.fromkeys(
             ['%s_accum_var' % sgmnt for sgmnt in SEGMENTATION], 0.0))
+        res.update({}.fromkeys(
+            ['prior_val_%s' % sgmnt for sgmnt in SEGMENTATION], 0.0))
+        res.update({}.fromkeys(
+            ['previous_val_%s' % sgmnt for sgmnt in SEGMENTATION], 0.0))
+        res.update({}.fromkeys(
+            ['prior_avg_%s' % sgmnt for sgmnt in SEGMENTATION], 0.0))
         return res
 
     def _get_price_on_consumed(self, row, vals, qntval):
@@ -135,10 +151,24 @@ class StockCardProduct(models.TransientModel):
     def _get_price_on_supplier_return(self, row, vals, qntval):
         vals['product_qty'] += (vals['direction'] * row['product_qty'])
         sm_obj = self.env['stock.move']
-        move_id = row['move_id']
-        move_brw = sm_obj.browse(move_id)
-        vals['move_valuation'] = sum([move_brw.price_unit * qnt['qty']
-                                      for qnt in qntval])
+        move_id = sm_obj.browse(row['move_id'])
+        # Cost is the one record in the stock_move, cost in the
+        # quant record includes other segmentation cost: landed_cost,
+        # material_cost, production_cost, subcontracting_cost
+        # Inventory Value has to be decreased by the amount of purchase
+        # TODO: BEWARE price_unit needs to be normalised
+        origin_id = move_id.origin_returned_move_id
+        current_quants = set(move_id.quant_ids.ids)
+        origin_quants = set(origin_id.quant_ids.ids)
+        quants_exists = current_quants.issubset(origin_quants)
+        if quants_exists:
+            vals['move_valuation'] = sum(
+                [qnt['cost'] * qnt['qty'] for qnt in qntval])
+        # / ! \ This is missing when current move's quants are partially
+        # located in origin's quants, so it's taking average cost temporarily
+        else:
+            vals['move_valuation'] = sum(
+                [vals['average'] * qnt['qty'] for qnt in qntval])
         for sgmnt in SEGMENTATION:
             vals['%s_valuation' % sgmnt] = sum(
                 [qnt['%s_cost' % sgmnt] * qnt['qty'] for qnt in qntval])
@@ -161,17 +191,18 @@ class StockCardProduct(models.TransientModel):
         sm_obj = self.env['stock.move']
         move_id = row['move_id']
         move_brw = sm_obj.browse(move_id)
-        origin_id = move_brw.origin_returned_move_id.id
+        origin_id = move_brw.origin_returned_move_id or move_brw.move_dest_id
+        origin_id = origin_id.id
         old_average = (
-            vals['move_dict'].get(origin_id, 0.0) and
-            vals['move_dict'][move_id]['average'] or vals['average'])
+            vals['move_dict'].get(origin_id) and
+            vals['move_dict'][origin_id]['average'] or vals['average'])
         vals['move_valuation'] = sum(
             [old_average * qnt['qty'] for qnt in qntval])
 
         for sgmnt in SEGMENTATION:
             old_average = (
-                vals['move_dict'].get(origin_id, 0.0) and
-                vals['move_dict'][move_id][sgmnt] or
+                vals['move_dict'].get(origin_id) and
+                vals['move_dict'][origin_id][sgmnt] or
                 vals[sgmnt])
 
             vals['%s_valuation' % sgmnt] = sum(
@@ -214,16 +245,12 @@ class StockCardProduct(models.TransientModel):
                     vals['%s_accum_var' % sgmnt] = 0.0
         else:
             vals['average'] = (
-                vals['product_qty'] and
-                vals['inventory_valuation'] / vals['product_qty'] or
-                vals['average'])
+                vals['inventory_valuation'] / vals['product_qty'] if
+                vals['product_qty'] else vals['average'])
             for sgmnt in SEGMENTATION:
                 vals[sgmnt] = (
-                    vals['product_qty'] and
-                    vals['%s_total' % sgmnt] / vals['product_qty'] or
-                    vals[sgmnt])
-        pass
-
+                    vals['%s_total' % sgmnt] / vals['product_qty'] if
+                    vals['product_qty'] else vals[sgmnt])
         return True
 
     def _pre_get_average_by_move(self, row, vals):
